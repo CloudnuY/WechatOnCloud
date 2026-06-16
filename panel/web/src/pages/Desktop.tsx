@@ -138,8 +138,26 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     // 「重新连接」按钮与「重启实例」后的重连同样走整页重载（见 restartInstance / 桌面无响应面板）。
     window.location.reload();
   };
-  // 麦克风开关（默认关）：默认不抢占麦克风，避免一打开实例就把 AirPods 切到低质通话模式；需要语音/通话时再开。
-  // 扬声器（听实例声音）始终可用、不受此开关影响。
+  // 声音（扬声器）开关，默认关。1.1.7 本就没有音频桥、连接很稳；音频是经一条额外 socket.io 连到实例 kclient，
+  // 为排除它对连接稳定性的影响、并回到 1.1.7 的连接行为，默认不连音频桥；想听声音再开（开关进 effect 依赖，
+  // 关→断开音频桥，开→建立）。
+  const [soundOn, setSoundOn] = useState(() => {
+    try {
+      return window.localStorage.getItem('woc_sound_on') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleSound = () => {
+    const v = !soundOn;
+    setSoundOn(v);
+    try {
+      window.localStorage.setItem('woc_sound_on', v ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  };
+  // 麦克风开关（默认关）：仅在「声音」开启时有意义；默认不抢占麦克风，避免把 AirPods 切到低质通话模式。
   const [micOn, setMicOn] = useState(() => {
     try {
       return window.localStorage.getItem('woc_mic_enabled') === '1';
@@ -338,7 +356,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   // 音频/麦克风桥接：实例就绪即自动连接 kclient 的音频流（扬声器恒开，无需手动找工具条）；
   // 仅当本实例处于焦点（标签页可见且窗口聚焦）时出声/收音，失焦立即断开，避免多实例多端串音。
   useEffect(() => {
-    if (!showVnc || !id) return;
+    if (!showVnc || !id || !soundOn) return; // 声音默认关：未开则完全不连音频桥（回到 1.1.7 无音频的连接行为）
     const audio = new VncAudio(id, micOn);
     audioRef.current = audio;
     audio.connect();
@@ -356,41 +374,14 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       audioRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showVnc, id]);
+  }, [showVnc, id, soundOn]);
 
-  // 切走 App / 锁屏会挂起这条 VNC 的 ws（并非干净关闭）。回到前台时 noVNC 自带的自动重连会立刻开一条
-  // 新 ws，而服务端那条旧连接可能尚未释放 → 新旧 ws 并存把实例 Xvnc 卡死（与已修的页内重挂同一根因，
-  // 只是这次由 noVNC 自动重连触发，是"开一段时间断联→卡死→要重启"的主因）。
-  // 对策：离开较久后回到前台，直接整页重载干净重连（先彻底关旧 ws 再连），从机制上避开并存。
-  // 仅在正展示桌面时生效；阈值可按手机实测微调（手机后台杀 ws 很快，桌面则较慢）。
-  useEffect(() => {
-    if (!showVnc) return;
-    const RESUME_RELOAD_AFTER_MS = 8000; // 离开≥8s 视为 ws 可能已被挂起/断开 → 回前台干净重连
-    let hiddenAt = 0;
-    const onVis = () => {
-      if (document.visibilityState === 'hidden') {
-        hiddenAt = Date.now();
-      } else if (hiddenAt && Date.now() - hiddenAt >= RESUME_RELOAD_AFTER_MS) {
-        if (id) api.clientLog(id, '回前台（离开较久）→ 整页重连');
-        window.location.reload();
-      } else {
-        hiddenAt = 0;
-      }
-    };
-    document.addEventListener('visibilitychange', onVis);
-    return () => document.removeEventListener('visibilitychange', onVis);
-  }, [showVnc, id]);
-
-  // VNC 连接健康监测 + 自动恢复 + 客户端连接日志。
-  // kasmweb 在 iframe 的 <html> 上打连接态 class（noVNC_connected/connecting/reconnecting/disconnected），
-  // 同源可靠读取。状态变化与动作都回传服务端（[client] 日志），与服务端 [vnc] 日志对齐便于排查。
-  // 要点：刚创建/重启的实例 KasmVNC 需约 10-15s 预热，期间 noVNC 会反复"connecting"——故阈值放宽到 30s，
-  // 先让预热 + noVNC 自带重连自行连上，不过早打断；持续连不上才整页重连，再不行才请求重启（都限流）。
+  // VNC 连接态监测——仅记录、不自动重连/重启。
+  // 1.1.7 本就没有任何"面板侧自动重连/自动重启"，连接很稳；本会话加的自动重载/自动重启(heal)/回前台重载
+  // 反而造成"频繁卡死/重启"的churn，故全部撤掉，回到 1.1.7 的行为：由 noVNC 自带重连兜底，仍不行用户手动
+  // 「重新连接/重启」。这里只把 kasmweb 在 iframe <html> 上的连接态 class 变化回传 [client] 日志，用于排查。
   useEffect(() => {
     if (!showVnc || !frameLoaded || !id) return;
-    const KEY = 'woc_vncReload_' + id;
-    const STUCK_MS = 30000;
-    let badSince = 0;
     let lastState = '';
     const t = window.setInterval(() => {
       let state = '';
@@ -409,64 +400,10 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       } catch {
         return; // 理论上同源；偶发不可读则跳过本次
       }
-      if (!state) return;
-      if (state !== lastState) {
+      if (state && state !== lastState) {
         lastState = state;
         api.clientLog(id, `VNC状态→${state}`);
       }
-      if (state === 'connected') {
-        badSince = 0;
-        try {
-          sessionStorage.removeItem(KEY);
-        } catch {
-          /* ignore */
-        }
-        return;
-      }
-      if (!badSince) {
-        badSince = Date.now();
-        return;
-      }
-      if (Date.now() - badSince < STUCK_MS) return; // 给预热 + noVNC 自带重连足够时间，别过早打断
-      badSince = 0;
-      let rec = { n: 0, t: 0 };
-      try {
-        rec = JSON.parse(sessionStorage.getItem(KEY) || '{"n":0,"t":0}');
-      } catch {
-        /* ignore */
-      }
-      if (Date.now() - rec.t > 180000) rec.n = 0; // 出 3 分钟窗口重置计数
-      if (rec.n >= 2) {
-        // 整页重连 2 次仍连不上 → 多半是实例 KasmVNC 接收器卡死（刷新/重启面板无效，只有重启容器能恢复）。
-        const HEAL_KEY = 'woc_vncHeal_' + id;
-        let lastHeal = 0;
-        try {
-          lastHeal = Number(sessionStorage.getItem(HEAL_KEY) || '0');
-        } catch {
-          /* ignore */
-        }
-        if (Date.now() - lastHeal < 180000) return; // 近期已自愈过，等它恢复
-        try {
-          sessionStorage.setItem(HEAL_KEY, String(Date.now()));
-        } catch {
-          /* ignore */
-        }
-        api.clientLog(id, '持续连不上（2 次整页重连无效）→ 请求重启实例自愈');
-        api
-          .healInstance(id)
-          .catch(() => {})
-          .finally(() => setTimeout(() => window.location.reload(), 1500));
-        return;
-      }
-      rec.n += 1;
-      rec.t = Date.now();
-      try {
-        sessionStorage.setItem(KEY, JSON.stringify(rec));
-      } catch {
-        /* ignore */
-      }
-      api.clientLog(id, `卡住 ${Math.round(STUCK_MS / 1000)}s（状态=${lastState}）→ 整页重连（第 ${rec.n} 次）`);
-      window.location.reload();
     }, 3000);
     return () => window.clearInterval(t);
   }, [showVnc, frameLoaded, id]);
@@ -700,16 +637,25 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               剪贴板
             </button>
             <button
-              className={'ws-action' + (micOn ? ' on' : '')}
-              title={
-                micOn
-                  ? '麦克风已开：占用本机麦克风（AirPods 等可能被切到低音质通话模式）。点击关闭'
-                  : '麦克风已关：不占用麦克风，AirPods 保持高音质输出。需要语音/通话时点此开启'
-              }
-              onClick={toggleMic}
+              className={'ws-action' + (soundOn ? ' on' : '')}
+              title={soundOn ? '声音已开：已连接实例音频。点击关闭（关闭可减少一条到实例的连接，更稳）' : '声音已关：默认不连音频桥（连接更稳）。点此开启以听到实例声音'}
+              onClick={toggleSound}
             >
-              麦克风：{micOn ? '开' : '关'}
+              声音：{soundOn ? '开' : '关'}
             </button>
+            {soundOn && (
+              <button
+                className={'ws-action' + (micOn ? ' on' : '')}
+                title={
+                  micOn
+                    ? '麦克风已开：占用本机麦克风（AirPods 等可能被切到低音质通话模式）。点击关闭'
+                    : '麦克风已关：不占用麦克风，AirPods 保持高音质输出。需要语音/通话时点此开启'
+                }
+                onClick={toggleMic}
+              >
+                麦克风：{micOn ? '开' : '关'}
+              </button>
+            )}
             {isAdmin && (
               <button className="ws-action" title="重启实例（修复卡死/最小化丢失）" onClick={restartInstance}>
                 重启
